@@ -4,7 +4,6 @@ import uuid
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, get_args, get_origin
-from weakref import WeakKeyDictionary
 
 from divkit_rs._native import (
     DivAction as NativeDivAction,
@@ -31,11 +30,14 @@ from divkit_rs._native import (
     compat_dump as _compat_dump_native,
 )
 from divkit_rs._native import (
+    normalize_pydivkit_json as _normalize_pydivkit_json,
+)
+from divkit_rs._native import (
     register_type_meta as _register_type_meta,
 )
 
 from .core.compat import classproperty
-from .core.fields import REF_MARKER_PREFIX, Expr, _Field
+from .core.fields import REF_MARKER_PREFIX, _Field
 
 
 def _is_ref_marker(value: Any) -> bool:
@@ -93,27 +95,14 @@ def _install_constructor_compat() -> None:
                 key: value for key, value in kwargs.items() if _is_tracked_constructor_value(value)
             }
             if tracked_constructor_values:
-                _constructor_values_set(instance, tracked_constructor_values)
+                instance._set_constructor_values(tracked_constructor_values)
             return instance
 
         cls.__new__ = staticmethod(_wrapped_new)
         cls.__dk_constructor_compat__ = True
 
 
-def _dump(value: Any) -> Any:
-    if value is None or type(value) in (int, float, bool):
-        return value
-    if isinstance(value, (str, bytes)):
-        return value
-    if isinstance(value, Expr):
-        return str(value)
-    if isinstance(value, (PyDivEntity, list, tuple, dict)):
-        return _compat_dump_native(value)
-    if isinstance(value, Mapping):
-        return _compat_dump_native(dict(value))
-    if isinstance(value, Sequence):
-        return [_dump(v) for v in value]
-    return value
+_dump = _compat_dump_native
 
 
 def _collect_template_names_from_json(value: Any, out: set[str]) -> None:
@@ -267,67 +256,11 @@ class _DualMethod:
 _ORIG_DICT = PyDivEntity.dict
 _ORIG_INIT = PyDivEntity.__init__
 _ORIG_SCHEMA = PyDivEntity.schema
-_ORIG_RELATED_TEMPLATES = getattr(PyDivEntity, "related_templates", lambda self: [])
 _ORIG_INIT_SUBCLASS = PyDivEntity.__init_subclass__
 _ORIG_GETATTRIBUTE = PyDivEntity.__getattribute__
 
 _TEMPLATE_REGISTRY: dict[str, type[PyDivEntity]] = {}
 _TEMPLATE_DEPENDENCY_CACHE: dict[type[PyDivEntity], frozenset[type[PyDivEntity]]] = {}
-_CONSTRUCTOR_VALUES: "WeakKeyDictionary[PyDivEntity, dict[str, Any]]" = WeakKeyDictionary()
-_RELATED_TEMPLATES_CACHE: "WeakKeyDictionary[PyDivEntity, frozenset[type[PyDivEntity]]]" = (
-    WeakKeyDictionary()
-)
-_CORNERS_RADIUS_KEY_ALIASES = {
-    "top_left": "top-left",
-    "top_right": "top-right",
-    "bottom_left": "bottom-left",
-    "bottom_right": "bottom-right",
-    "$top_left": "$top-left",
-    "$top_right": "$top-right",
-    "$bottom_left": "$bottom-left",
-    "$bottom_right": "$bottom-right",
-}
-_PYDIVKIT_FLOAT_KEYS = {"alpha", "ratio", "weight", "letter_spacing"}
-
-
-def _constructor_values_get(entity: PyDivEntity) -> dict[str, Any] | None:
-    try:
-        return _CONSTRUCTOR_VALUES.get(entity)
-    except TypeError:
-        return None
-
-
-def _constructor_values_set(entity: PyDivEntity, values: dict[str, Any]) -> None:
-    try:
-        _CONSTRUCTOR_VALUES[entity] = values
-    except TypeError:
-        pass
-
-
-def _related_templates_cache_get(
-    entity: PyDivEntity,
-) -> frozenset[type[PyDivEntity]] | None:
-    try:
-        return _RELATED_TEMPLATES_CACHE.get(entity)
-    except TypeError:
-        return None
-
-
-def _related_templates_cache_set(
-    entity: PyDivEntity,
-    value: frozenset[type[PyDivEntity]],
-) -> None:
-    try:
-        _RELATED_TEMPLATES_CACHE[entity] = value
-    except TypeError:
-        pass
-
-
-def _invalidate_related_templates_cache(entity: PyDivEntity) -> None:
-    try:
-        _RELATED_TEMPLATES_CACHE.pop(entity, None)
-    except TypeError:
-        pass
 
 
 def _template_name_for_class(cls: type[PyDivEntity]) -> str:
@@ -493,7 +426,7 @@ def _compat_init_subclass(cls: type[PyDivEntity], **kwargs: Any) -> None:
         template_name = _template_name_for_class(cls)
         _TEMPLATE_REGISTRY[template_name] = cls
         _TEMPLATE_DEPENDENCY_CACHE.clear()
-        _RELATED_TEMPLATES_CACHE.clear()
+        PyDivEntity._bump_related_templates_cache_epoch()
 
         # Keep template type in nested native serialization.
         # The original base type is preserved in __dk_base_type__ and used by template().
@@ -541,26 +474,33 @@ def _compat_entity_init(self: PyDivEntity, **kwargs: Any) -> None:
     for field_name, field in getattr(type(self), "__dk_fields__", {}).items():
         if field_name not in kwargs:
             setattr(self, field_name, field.default)
+    defaults = type(self).__dict__.get("__dk_defaults__")
+    if defaults:
+        try:
+            self._set_defaults(defaults)
+        except Exception:
+            pass
 
 
 def _compat_getattribute(self: PyDivEntity, name: str) -> Any:
     # Keep mutable references for constructor-assigned nested entities, so
     # patterns like `obj.margins.top = ...` behave like in pydivkit.
-    if not name.startswith("__"):
-        constructor_values = _constructor_values_get(self)
-        if constructor_values:
-            value = constructor_values.get(name)
-            if isinstance(value, PyDivEntity):
-                return value
+    if not name.startswith("_"):
+        value = self._get_constructor_value(name)
+        if isinstance(value, PyDivEntity):
+            try:
+                self._mark_constructor_dirty()
+            except Exception:
+                pass
+            return value
     value = _ORIG_GETATTRIBUTE(self, name)
     if name == "margins" and isinstance(value, dict):
         entity_value = NativeDivEdgeInsets(**value)
-        constructor_values = _constructor_values_get(self)
-        if constructor_values is None:
-            constructor_values = {}
-            _constructor_values_set(self, constructor_values)
-        constructor_values[name] = entity_value
-        _invalidate_related_templates_cache(self)
+        self._set_constructor_value(name, entity_value)
+        try:
+            self._mark_constructor_dirty()
+        except Exception:
+            pass
         return entity_value
     if name == "actions" and isinstance(value, list):
         if all(isinstance(item, dict) for item in value):
@@ -571,98 +511,8 @@ def _compat_getattribute(self: PyDivEntity, name: str) -> Any:
     return value
 
 
-def _compat_related_templates(self: PyDivEntity) -> set[type[PyDivEntity]]:
-    cached = _related_templates_cache_get(self)
-    if cached is not None:
-        return set(cached)
-
-    cls = type(self)
-    related: set[type[PyDivEntity]] = set()
-
-    if getattr(cls, "__dk_is_template__", False):
-        related.update(_template_dependency_closure(cls))
-
-    native_related = _ORIG_RELATED_TEMPLATES(self)
-    if native_related:
-        for template_cls in native_related:
-            related.update(_template_dependency_closure(template_cls))
-
-    # Fast path for template discovery in instance payload:
-    # prefer native dict serialization and supplement with constructor-cached
-    # mutable entities (for post-init nested attribute updates).
-    try:
-        payload = _ORIG_DICT(self)
-    except Exception:
-        payload = None
-    if payload is not None:
-        template_names: set[str] = set()
-        _collect_template_names_from_json(payload, template_names)
-        for template_name in template_names:
-            template_cls = _TEMPLATE_REGISTRY.get(template_name)
-            if template_cls is not None:
-                related.update(_template_dependency_closure(template_cls))
-
-    constructor_values = _constructor_values_get(self)
-    if constructor_values:
-        constructor_related: set[type[PyDivEntity]] = set()
-        for constructor_value in constructor_values.values():
-            _collect_related_templates_from_value(constructor_value, constructor_related)
-        for template_cls in constructor_related:
-            related.update(_template_dependency_closure(template_cls))
-
-    frozen = frozenset(related)
-    _related_templates_cache_set(self, frozen)
-    return set(frozen)
-
-
 def _compat_dict(self: PyDivEntity) -> dict[str, Any]:
-    result = _ORIG_DICT(self)
-    cls = type(self)
-    constructor_values = _constructor_values_get(self)
-    defaults = getattr(cls, "__dk_defaults__", {})
-    is_template = getattr(cls, "__dk_is_template__", False)
-    if not constructor_values and not defaults and not is_template:
-        return result
-    if constructor_values:
-        for field_name, constructor_value in constructor_values.items():
-            if field_name not in result:
-                continue
-            current = result[field_name]
-            if isinstance(constructor_value, PyDivEntity):
-                raw_value = constructor_value
-            else:
-                try:
-                    # Avoid compat __getattribute__ overhead on hot dict() path.
-                    # Constructor-backed mutable values are still taken from cache above.
-                    raw_value = _ORIG_GETATTRIBUTE(self, field_name)
-                except Exception:
-                    continue
-            if (
-                isinstance(raw_value, (str, bytes))
-                and isinstance(constructor_value, (Sequence, Mapping, PyDivEntity))
-                and not isinstance(constructor_value, (str, bytes))
-            ):
-                # Rust serializer stringifies tuple-like inputs in some fields.
-                # If runtime value is a string repr, reuse normalized constructor input.
-                raw_value = constructor_value
-            if isinstance(raw_value, PyDivEntity):
-                dumped_raw = _dump(raw_value)
-                if dumped_raw != current:
-                    result[field_name] = dumped_raw
-                continue
-            if isinstance(raw_value, (str, bytes)):
-                continue
-            if isinstance(raw_value, (Sequence, Mapping, PyDivEntity)):
-                dumped_raw = _dump(raw_value)
-                if dumped_raw != current:
-                    result[field_name] = dumped_raw
-    for field_name, default in defaults.items():
-        if field_name in result or default is None:
-            continue
-        result[field_name] = _dump(default)
-    if is_template:
-        result["type"] = _template_name_for_class(cls)
-    return result
+    return _ORIG_DICT(self)
 
 
 def _compat_schema(target: Any, exclude_fields: list[str] | None = None) -> dict[str, Any]:
@@ -763,50 +613,13 @@ def _compat_make_card(
 
 
 def _compat_make_div(div: PyDivEntity) -> dict[str, Any]:
-    templates: set[type[PyDivEntity]] = set()
-    for template_cls in div.related_templates():
-        templates.update(_template_dependency_closure(template_cls))
+    templates: set[type[PyDivEntity]] = set(div.related_templates())
 
     result = {
         "templates": {template.template_name: template.template() for template in templates},
         "card": _compat_make_card("card", div).dict(),
     }
     return _normalize_pydivkit_json(result)
-
-
-def _normalize_pydivkit_json(value: Any, parent_key: str | None = None) -> Any:
-    if isinstance(value, list):
-        return [_normalize_pydivkit_json(item, parent_key=parent_key) for item in value]
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            normalized_key = _CORNERS_RADIUS_KEY_ALIASES.get(key, key)
-            normalized_value = _normalize_pydivkit_json(item, parent_key=normalized_key)
-            if (
-                normalized_key in _PYDIVKIT_FLOAT_KEYS
-                and isinstance(normalized_value, int)
-                and not isinstance(normalized_value, bool)
-            ):
-                normalized_value = float(normalized_value)
-            if (
-                normalized_key == "value"
-                and parent_key in {"x", "y"}
-                and isinstance(normalized_value, int)
-                and not isinstance(normalized_value, bool)
-            ):
-                normalized_value = float(normalized_value)
-            if (
-                normalized_key == "width"
-                and parent_key == "stroke"
-                and isinstance(normalized_value, int)
-                and not isinstance(normalized_value, bool)
-            ):
-                normalized_value = float(normalized_value)
-            if normalized_key == "color" and isinstance(normalized_value, int):
-                normalized_value = str(normalized_value)
-            result[normalized_key] = normalized_value
-        return result
-    return value
 
 
 def install_pydivkit_compat() -> None:
@@ -816,7 +629,6 @@ def install_pydivkit_compat() -> None:
     PyDivEntity.__getattribute__ = _compat_getattribute
     PyDivEntity.__init_subclass__ = classmethod(_compat_init_subclass)
     PyDivEntity.dict = _compat_dict
-    PyDivEntity.related_templates = _compat_related_templates
     PyDivEntity.schema = _DualMethod(_compat_schema)
     PyDivEntity.update_forward_refs = classmethod(lambda cls: None)
     PyDivEntity.template_name = classproperty(lambda cls: _template_name_for_class(cls))
