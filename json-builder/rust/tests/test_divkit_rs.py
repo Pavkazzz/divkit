@@ -398,6 +398,12 @@ class TestIntegration:
         t = DivText(text="hi")
         assert t.build() == t.dict()
 
+    def test_compat_dict_function_matches_native_dict_output(self):
+        from divkit_rs._pydivkit_compat import _compat_dict
+
+        t = DivText(text="compat-check", max_lines=2)
+        assert _compat_dict(t) == t.dict()
+
     def test_getattr(self):
         t = DivText(text="hello", font_size=14)
         assert t.text == "hello"
@@ -1124,6 +1130,23 @@ class TestPydivkitCompatibilityLayer:
         assert result["templates"][ModuleLikeText.template_name]["type"] == "text"
         assert result["templates"][ModuleLikeText.template_name]["font_size"] == 16
 
+    def test_make_div_collects_transitive_template_dependencies(self):
+        class LeafTpl(DivText):
+            ranges = []
+
+        class MidTpl(DivContainer):
+            items = [{"type": LeafTpl.template_name}]
+
+        class RootTpl(DivContainer):
+            items = [{"type": MidTpl.template_name}]
+
+        root = DivContainer(items=[RootTpl(items=[])])
+        result = divkit_rs.make_div(root)
+
+        assert RootTpl.template_name in result["templates"]
+        assert MidTpl.template_name in result["templates"]
+        assert LeafTpl.template_name in result["templates"]
+
     def test_make_card_accepts_multiple_divs(self):
         card = divkit_rs.make_card(
             "card",
@@ -1175,6 +1198,17 @@ class TestPydivkitCompatibilityLayer:
         assert card["variables"] == []
         assert card["variable_triggers"] == []
         assert card["timers"] == []
+
+    def test_make_card_rejects_mixed_positional_and_divs_keyword(self):
+        with pytest.raises(
+            TypeError,
+            match="Provide either positional divs or `divs=` keyword, not both",
+        ):
+            divkit_rs.make_card(
+                "card",
+                DivText(text="first"),
+                divs=[DivText(text="second")],
+            )
 
     def test_actions_getattr_returns_entities(self):
         text = DivText(
@@ -1246,6 +1280,31 @@ class TestPydivkitCompatibilityLayer:
         assert LateTpl.template_name in result_after["templates"]
         assert result_after["templates"][LateTpl.template_name]["type"] == "text"
 
+    def test_related_templates_updates_after_late_template_registration(self):
+        Root = type(
+            "RootRelated",
+            (DivContainer,),
+            {
+                "__module__": "late.related.module",
+                "items": [{"type": "late.related.module.LateTpl"}],
+            },
+        )
+
+        related_before = Root().related_templates()
+        assert all(
+            template.template_name != "late.related.module.LateTpl"
+            for template in related_before
+        )
+
+        LateTpl = type(
+            "LateTpl",
+            (DivText,),
+            {"__module__": "late.related.module"},
+        )
+
+        related_after = Root().related_templates()
+        assert LateTpl in related_after
+
     def test_related_templates_cached_result_is_not_mutated_by_caller(self):
         class Header(DivContainer):
             items = []
@@ -1257,6 +1316,27 @@ class TestPydivkitCompatibilityLayer:
         # Cache returns an isolated set, so caller mutation does not leak.
         related.add(DivText)
         assert DivText not in root.related_templates()
+
+    def test_related_templates_collects_mixed_constructor_values(self):
+        class LeafTpl(DivText):
+            ranges = []
+
+        class MidTpl(DivContainer):
+            items = [{"type": LeafTpl.template_name}]
+
+        root = DivContainer(items=[])
+        root._set_constructor_values(
+            {
+                "tpl_type": MidTpl,
+                "tpl_entity": MidTpl(items=[]),
+                "tpl_dict": {"type": MidTpl.template_name, "items": [{"type": LeafTpl.template_name}]},
+                "tpl_list": [MidTpl(items=[]), {"type": LeafTpl.template_name}],
+            }
+        )
+
+        related = root.related_templates()
+        assert MidTpl in related
+        assert LeafTpl in related
 
     def test_div_module_namespaces(self):
         import divkit_rs.div as div
