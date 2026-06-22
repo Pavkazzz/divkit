@@ -1,0 +1,1759 @@
+"""Tests for divkit_rs Python bindings.
+
+Run with: pytest tests/ (after `maturin develop`)
+"""
+
+import enum
+from collections.abc import Mapping, Sequence
+from copy import copy, deepcopy
+
+import divkit_rs
+import pytest
+from divkit_rs import (
+    BaseDiv,
+    BooleanVariable,
+    DivAction,
+    DivActionClearFocus,
+    DivActionCopyToClipboard,
+    DivActionDownload,
+    DivActionFocusElement,
+    DivActionHideTooltip,
+    DivActionScrollTo,
+    DivActionSetState,
+    DivActionSetVariable,
+    DivActionShowTooltip,
+    DivActionSubmit,
+    DivActionSubmitRequest,
+    DivActionTimer,
+    DivActionVideo,
+    DivAspect,
+    DivBorder,
+    DivContainer,
+    DivCornersRadius,
+    DivDimension,
+    DivEdgeInsets,
+    DivFixedSize,
+    DivFontWeight,
+    DivImage,
+    DivLinearGradient,
+    DivMatchParentSize,
+    DivPoint,
+    DivShadow,
+    DivSolidBackground,
+    DivState,
+    DivStateState,
+    DivStroke,
+    DivTabs,
+    DivTabsItem,
+    DivText,
+    DivTextRange,
+    DivTransform,
+    DivVideo,
+    DivVideoSource,
+    DivVisibility,
+    DivVisibilityAction,
+    DivWrapContentSize,
+    Field,
+    IndexDestination,
+    IntegerVariable,
+    PyDivEntity,
+    Ref,
+    RequestHeader,
+    StringValue,
+)
+
+
+class _CustomMapping(Mapping):
+    def __init__(self, data):
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+
+class _CustomSequence(Sequence):
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __getitem__(self, index):
+        return self._items[index]
+
+    def __len__(self):
+        return len(self._items)
+
+
+# ================================================================
+# JSON output parity: preprod must match prod
+# ================================================================
+
+
+class TestJsonOutputParity:
+    """Preprod JSON output must match prod for all field types."""
+
+    # --- corners_radius keys must use hyphens ---
+
+    def test_corners_radius_hyphen_keys(self):
+        d = DivCornersRadius(top_left=8, bottom_right=4).dict()
+        assert "top-left" in d
+        assert "bottom-right" in d
+        assert d["top-left"] == 8
+        assert d["bottom-right"] == 4
+
+    def test_corners_radius_all_keys(self):
+        d = DivCornersRadius(
+            top_left=1,
+            top_right=2,
+            bottom_left=3,
+            bottom_right=4,
+        ).dict()
+        assert list(sorted(d.keys())) == [
+            "bottom-left",
+            "bottom-right",
+            "top-left",
+            "top-right",
+        ]
+
+    # --- whole-number floats stay as float ---
+
+    def test_alpha_whole_float_stays_float(self):
+        d = DivText(text="hi", alpha=1.0).dict()
+        assert isinstance(d["alpha"], float)
+        assert d["alpha"] == 1.0
+
+    def test_alpha_zero_float_stays_float(self):
+        d = DivText(text="hi", alpha=0.0).dict()
+        assert isinstance(d["alpha"], float)
+        assert d["alpha"] == 0.0
+
+    def test_stroke_width_whole_float_stays_float(self):
+        d = DivStroke(color="#000", width=1.0).dict()
+        assert isinstance(d["width"], float)
+        assert d["width"] == 1.0
+
+    def test_transform_rotation_zero_stays_float(self):
+        d = DivTransform(rotation=0.0).dict()
+        assert isinstance(d["rotation"], float)
+        assert d["rotation"] == 0.0
+
+    def test_transform_rotation_whole_stays_float(self):
+        d = DivTransform(rotation=45.0).dict()
+        assert isinstance(d["rotation"], float)
+        assert d["rotation"] == 45.0
+
+    # --- normalize must coerce rotation int → float ---
+
+    def test_normalize_coerces_rotation_to_float(self):
+        from divkit_rs._native import normalize_pydivkit_json
+
+        n = normalize_pydivkit_json({"rotation": 0})
+        assert isinstance(n["rotation"], float)
+        assert n["rotation"] == 0.0
+
+    # --- boolean_int fields: int 0/1 → bool ---
+
+    def test_clip_to_bounds_int_one_coerced_to_true(self):
+        d = DivContainer(items=[], clip_to_bounds=1).dict()
+        assert d["clip_to_bounds"] is True
+
+    def test_clip_to_bounds_int_zero_coerced_to_false(self):
+        d = DivContainer(items=[], clip_to_bounds=0).dict()
+        assert d["clip_to_bounds"] is False
+
+    def test_has_shadow_int_coerced_to_bool(self):
+        d = DivBorder(has_shadow=1).dict()
+        assert d["has_shadow"] is True
+
+    def test_bool_passthrough_unchanged(self):
+        d = DivContainer(items=[], clip_to_bounds=True).dict()
+        assert d["clip_to_bounds"] is True
+
+    # --- integer variable: string value → int ---
+
+    def test_integer_variable_string_value_coerced_to_int(self):
+        d = IntegerVariable(name="x", value="10522").dict()
+        assert d["value"] == 10522
+        assert isinstance(d["value"], int)
+
+    def test_integer_variable_int_value_unchanged(self):
+        d = IntegerVariable(name="x", value=42).dict()
+        assert d["value"] == 42
+        assert isinstance(d["value"], int)
+
+    # --- boolean variable: int 0/1 → bool ---
+
+    def test_boolean_variable_int_one_coerced_to_true(self):
+        d = BooleanVariable(name="flag", value=1).dict()
+        assert d["value"] is True
+
+    def test_boolean_variable_int_zero_coerced_to_false(self):
+        d = BooleanVariable(name="flag", value=0).dict()
+        assert d["value"] is False
+
+    def test_boolean_variable_bool_passthrough(self):
+        d = BooleanVariable(name="flag", value=True).dict()
+        assert d["value"] is True
+
+    # --- visibility_action is_enabled: int 0/1 → bool ---
+
+    def test_visibility_action_is_enabled_int_coerced_to_bool(self):
+        d = DivVisibilityAction(log_id="appear", is_enabled=1).dict()
+        assert d["is_enabled"] is True
+
+    def test_visibility_action_is_enabled_zero_coerced_to_false(self):
+        d = DivVisibilityAction(log_id="appear", is_enabled=0).dict()
+        assert d["is_enabled"] is False
+
+    # --- shadow offset value: float preserved ---
+
+    def test_shadow_offset_value_float_preserved(self):
+        shadow = DivShadow(
+            alpha=1.0,
+            offset=DivPoint(
+                x=DivDimension(value=0.0),
+                y=DivDimension(value=-2.0),
+            ),
+        )
+        d = shadow.dict()
+        assert isinstance(d["alpha"], float)
+        assert isinstance(d["offset"]["x"]["value"], float)
+        assert isinstance(d["offset"]["y"]["value"], float)
+        assert d["offset"]["y"]["value"] == -2.0
+
+    # --- match_parent weight: float preserved ---
+
+    def test_match_parent_weight_float_preserved(self):
+        d = DivMatchParentSize(weight=1.0).dict()
+        assert isinstance(d["weight"], float)
+        assert d["weight"] == 1.0
+
+
+# ================================================================
+# Fix #3 — Boolean serialization
+# ================================================================
+
+
+class TestBoolSerialization:
+    """Booleans must serialize as JSON true/false, not 0/1."""
+
+    def test_bool_true_serializes_as_true(self):
+        d = DivWrapContentSize(constrained=True).dict()
+        assert d["constrained"] is True
+
+    def test_bool_false_serializes_as_false(self):
+        d = DivWrapContentSize(constrained=False).dict()
+        assert d["constrained"] is False
+
+    def test_bool_type_is_bool(self):
+        d = DivBorder(has_shadow=True).dict()
+        assert type(d["has_shadow"]) is bool
+
+    def test_bool_in_nested_entity(self):
+        c = DivContainer(
+            items=[],
+            border=DivBorder(has_shadow=True),
+        )
+        d = c.dict()
+        assert d["border"]["has_shadow"] is True
+
+
+# ================================================================
+# Fix #2 — Float serialization
+# ================================================================
+
+
+class TestFloatSerialization:
+    """Float values preserve their type through serialization."""
+
+    def test_whole_float_stays_float(self):
+        d = DivAspect(ratio=1.0).dict()
+        assert d["ratio"] == 1.0
+        assert isinstance(d["ratio"], float)
+
+    def test_fractional_float_stays_float(self):
+        d = DivAspect(ratio=1.5).dict()
+        assert d["ratio"] == 1.5
+        assert isinstance(d["ratio"], float)
+
+    def test_weight_whole_float_stays_float(self):
+        d = DivMatchParentSize(weight=2.0).dict()
+        assert d["weight"] == 2.0
+        assert isinstance(d["weight"], float)
+
+    def test_zero_float_stays_float(self):
+        d = DivAspect(ratio=0.0).dict()
+        assert d["ratio"] == 0.0
+        assert isinstance(d["ratio"], float)
+
+    def test_negative_whole_float_stays_float(self):
+        d = DivEdgeInsets(left=-8.0).dict()
+        assert d["left"] == -8.0
+        assert isinstance(d["left"], float)
+
+    def test_number_schema_int_coerced_to_float(self):
+        """Int values for Number-typed fields become float (pydivkit parity)."""
+        d = DivAspect(ratio=1).dict()
+        assert d["ratio"] == 1.0
+        assert isinstance(d["ratio"], float)
+
+
+# ================================================================
+# Fix #5 — Entity constructors are real Python classes
+# ================================================================
+
+
+class TestEntityClasses:
+    """Entity constructors must be real types, not factory functions."""
+
+    def test_constructor_is_a_type(self):
+        assert isinstance(DivContainer, type)
+        assert isinstance(DivText, type)
+        assert isinstance(DivImage, type)
+
+    def test_isinstance_check(self):
+        c = DivContainer(items=[])
+        assert isinstance(c, DivContainer)
+
+    def test_isinstance_base_class(self):
+        c = DivContainer(items=[])
+        assert isinstance(c, PyDivEntity)
+
+    def test_isinstance_negative(self):
+        t = DivText(text="hi")
+        assert not isinstance(t, DivContainer)
+
+    def test_subclassing(self):
+        class MyContainer(DivContainer):
+            pass
+
+        mc = MyContainer(items=[])
+        assert isinstance(mc, MyContainer)
+        assert isinstance(mc, DivContainer)
+        assert isinstance(mc, PyDivEntity)
+
+    def test_subclass_dict_works(self):
+        class MyContainer(DivContainer):
+            pass
+
+        mc = MyContainer(items=[], orientation="vertical")
+        d = mc.dict()
+        assert d["type"] == "container"
+        assert d["orientation"] == "vertical"
+
+    def test_subclass_schema_works(self):
+        class MyContainer(DivContainer):
+            pass
+
+        mc = MyContainer(items=[])
+        s = mc.schema()
+        assert "properties" in s
+        assert "items" in s["properties"]
+
+    def test_type_name(self):
+        assert DivContainer.__name__ == "DivContainer"
+        assert DivText.__name__ == "DivText"
+
+    def test_entity_dict_output(self):
+        """dict() still produces correct output after the class refactor."""
+        c = DivContainer(
+            items=[DivText(text="hello")],
+            orientation="vertical",
+        )
+        d = c.dict()
+        assert d["type"] == "container"
+        assert d["orientation"] == "vertical"
+        assert len(d["items"]) == 1
+        assert d["items"][0]["type"] == "text"
+        assert d["items"][0]["text"] == "hello"
+
+
+# ================================================================
+# Fix #6 — Enums are real enum.Enum subclasses
+# ================================================================
+
+
+class TestEnums:
+    """Enum types must be real str+Enum for isinstance, constructors, etc."""
+
+    def test_is_enum_subclass(self):
+        assert issubclass(DivFontWeight, enum.Enum)
+
+    def test_is_str_subclass(self):
+        assert issubclass(DivFontWeight, str)
+
+    def test_value_equality(self):
+        assert DivFontWeight.BOLD == "bold"
+        assert DivFontWeight.REGULAR == "regular"
+        assert DivVisibility.VISIBLE == "visible"
+        assert DivVisibility.GONE == "gone"
+
+    def test_isinstance_check(self):
+        assert isinstance(DivFontWeight.BOLD, DivFontWeight)
+        assert isinstance(DivVisibility.VISIBLE, DivVisibility)
+
+    def test_constructor_from_value(self):
+        fw = DivFontWeight("bold")
+        assert fw is DivFontWeight.BOLD
+
+    def test_constructor_invalid_value(self):
+        with pytest.raises(ValueError):
+            DivFontWeight("nonexistent")
+
+    def test_str_returns_value(self):
+        """str() must return the raw value for backward compatibility."""
+        assert str(DivFontWeight.BOLD) == "bold"
+        assert str(DivVisibility.GONE) == "gone"
+
+    def test_enum_in_entity_serialization(self):
+        t = DivText(text="hi", font_weight=DivFontWeight.BOLD)
+        d = t.dict()
+        assert d["font_weight"] == "bold"
+
+    def test_enum_iteration(self):
+        members = list(DivFontWeight)
+        values = [m.value for m in members]
+        assert "bold" in values
+        assert "light" in values
+        assert "regular" in values
+        assert "medium" in values
+
+
+# ================================================================
+# Schema completeness
+# ================================================================
+
+
+class TestSchema:
+    """schema() must report all valid fields for an entity."""
+
+    def test_container_schema_comprehensive(self):
+        s = DivContainer(items=[]).schema()
+        props = s["properties"]
+        # DivContainer has 55+ fields plus type
+        assert len(props) > 40
+
+    def test_container_has_common_base_fields(self):
+        props = DivContainer(items=[]).schema()["properties"]
+        for field in [
+            "type",
+            "items",
+            "visibility",
+            "visibility_actions",
+            "selected_actions",
+            "aspect",
+            "clip_to_bounds",
+            "background",
+            "border",
+            "paddings",
+            "margins",
+            "width",
+            "height",
+            "id",
+            "alpha",
+        ]:
+            assert field in props, f"Missing field: {field}"
+
+    def test_text_schema_comprehensive(self):
+        props = DivText(text="x").schema()["properties"]
+        assert len(props) > 40
+        for field in [
+            "text",
+            "font_size",
+            "font_weight",
+            "text_color",
+            "letter_spacing",
+            "line_height",
+            "max_lines",
+        ]:
+            assert field in props, f"Missing field: {field}"
+
+    def test_schema_exclude_fields(self):
+        s = DivText(text="x").schema(exclude_fields=["accessibility", "actions"])
+        props = s["properties"]
+        assert "accessibility" not in props
+        assert "actions" not in props
+        assert "text" in props
+
+
+# ================================================================
+# dict() omits unset fields (issue #4 — verifying current behavior)
+# ================================================================
+
+
+class TestDictMinimal:
+    """dict() should only include explicitly set fields + type."""
+
+    def test_minimal_container(self):
+        d = DivContainer(items=[]).dict()
+        # Should have type + items, nothing else
+        assert set(d.keys()) == {"type", "items"}
+
+    def test_minimal_text(self):
+        d = DivText(text="hi").dict()
+        assert set(d.keys()) == {"type", "text"}
+
+    def test_all_set_fields_present(self):
+        d = DivText(text="hi", font_size=16, max_lines=2).dict()
+        assert d == {"type": "text", "text": "hi", "font_size": 16, "max_lines": 2}
+
+
+# ================================================================
+# General regression / integration
+# ================================================================
+
+
+class TestIntegration:
+    """End-to-end tests for common patterns."""
+
+    def test_nested_entities(self):
+        card = DivContainer(
+            items=[
+                DivText(text="Title", font_size=20),
+                DivImage(
+                    image_url="https://example.com/img.png",
+                    width=DivFixedSize(value=100),
+                    height=DivFixedSize(value=100),
+                ),
+            ],
+            orientation="vertical",
+            paddings=DivEdgeInsets(left=16, right=16),
+            background=[DivSolidBackground(color="#ffffff")],
+        )
+        d = card.dict()
+        assert d["type"] == "container"
+        assert len(d["items"]) == 2
+        assert d["items"][0]["font_size"] == 20
+        assert d["items"][1]["width"] == {"type": "fixed", "value": 100}
+        assert d["paddings"]["left"] == 16
+        assert d["background"][0] == {"type": "solid", "color": "#ffffff"}
+
+    def test_actions_serialization(self):
+        t = DivText(
+            text="Click me",
+            actions=[DivAction(log_id="tap", url="https://example.com")],
+        )
+        d = t.dict()
+        assert len(d["actions"]) == 1
+        assert d["actions"][0]["log_id"] == "tap"
+        assert d["actions"][0]["url"] == "https://example.com"
+
+    def test_gradient_background(self):
+        bg = DivLinearGradient(angle=90, colors=["#ff0000", "#0000ff"])
+        d = bg.dict()
+        assert d["type"] == "gradient"
+        assert d["angle"] == 90
+        assert d["colors"] == ["#ff0000", "#0000ff"]
+
+    def test_build_is_alias_for_dict(self):
+        t = DivText(text="hi")
+        assert t.build() == t.dict()
+
+    def test_compat_dict_function_matches_native_dict_output(self):
+        from divkit_rs._pydivkit_compat import _compat_dict
+
+        t = DivText(text="compat-check", max_lines=2)
+        assert _compat_dict(t) == t.dict()
+
+    def test_getattr(self):
+        t = DivText(text="hello", font_size=14)
+        assert t.text == "hello"
+        assert t.font_size == 14
+
+    def test_setattr(self):
+        t = DivText(text="hello")
+        t.font_size = 14
+        d = t.dict()
+        assert d["font_size"] == 14
+
+
+# ================================================================
+# Duck-typed .dict() protocol on unknown objects
+# ================================================================
+
+
+class TestDictProtocol:
+    """Objects with a .dict() method should be auto-converted, not str()-ified."""
+
+    def test_plain_object_with_dict_method(self):
+        """A plain Python class with .dict() is accepted in kwargs."""
+
+        class FakeEntity:
+            def dict(self):
+                return {"type": "solid", "color": "#ff0000"}
+
+        c = DivContainer(items=[], background=[FakeEntity()])
+        d = c.dict()
+        assert len(d["background"]) == 1
+        assert d["background"][0] == {"type": "solid", "color": "#ff0000"}
+
+    def test_nested_dict_protocol(self):
+        """Nested objects with .dict() are recursively resolved."""
+
+        class FakeSize:
+            def dict(self):
+                return {"type": "fixed", "value": 42}
+
+        img = DivImage(image_url="https://example.com/a.png", width=FakeSize())
+        d = img.dict()
+        assert d["width"] == {"type": "fixed", "value": 42}
+
+    def test_dict_protocol_in_list(self):
+        """Objects with .dict() work inside lists."""
+
+        class FakeAction:
+            def dict(self):
+                return {"log_id": "tap", "url": "https://example.com"}
+
+        t = DivText(text="hi", actions=[FakeAction()])
+        d = t.dict()
+        assert d["actions"][0]["log_id"] == "tap"
+
+    def test_dict_protocol_returns_nested_dict(self):
+        """A .dict() returning nested dicts preserves the structure."""
+
+        class FakeBorder:
+            def dict(self):
+                return {"has_shadow": True, "corner_radius": 8}
+
+        c = DivContainer(items=[], border=FakeBorder())
+        d = c.dict()
+        assert d["border"]["has_shadow"] is True
+        assert d["border"]["corner_radius"] == 8
+
+    def test_divkit_entity_still_preferred(self):
+        """Native PyDivEntity subclasses are still handled via the fast path."""
+        bg = DivSolidBackground(color="#00ff00")
+        c = DivContainer(items=[], background=[bg])
+        d = c.dict()
+        assert d["background"][0] == {"type": "solid", "color": "#00ff00"}
+
+    def test_object_without_dict_falls_back_to_string(self):
+        """Objects without .dict() still fall back to str()."""
+
+        class Stringable:
+            def __str__(self):
+                return "hello-from-str"
+
+        t = DivText(text=Stringable())
+        d = t.dict()
+        assert d["text"] == "hello-from-str"
+
+
+# ================================================================
+# Newly exported types — DivAction*, DivVideo, DivTextRange, etc.
+# ================================================================
+
+
+class TestNewlyExportedTypes:
+    """Verify that previously missing types are now importable and functional."""
+
+    # --- DivAction typed actions ---
+
+    def test_action_set_state(self):
+        a = DivActionSetState(state_id="0/my_state/active")
+        d = a.dict()
+        assert d["type"] == "set_state"
+        assert d["state_id"] == "0/my_state/active"
+
+    def test_action_set_variable(self):
+        a = DivActionSetVariable(variable_name="my_var", value=StringValue(value="hello"))
+        d = a.dict()
+        assert d["type"] == "set_variable"
+        assert d["variable_name"] == "my_var"
+
+    def test_action_clear_focus(self):
+        a = DivActionClearFocus()
+        d = a.dict()
+        assert d["type"] == "clear_focus"
+
+    def test_action_focus_element(self):
+        a = DivActionFocusElement(element_id="my_input")
+        d = a.dict()
+        assert d["type"] == "focus_element"
+        assert d["element_id"] == "my_input"
+
+    def test_action_show_tooltip(self):
+        a = DivActionShowTooltip(id="tip1")
+        d = a.dict()
+        assert d["type"] == "show_tooltip"
+        assert d["id"] == "tip1"
+
+    def test_action_hide_tooltip(self):
+        a = DivActionHideTooltip(id="tip1")
+        d = a.dict()
+        assert d["type"] == "hide_tooltip"
+
+    def test_action_scroll_to(self):
+        a = DivActionScrollTo(
+            id="gallery1",
+            destination=IndexDestination(value=3),
+        )
+        d = a.dict()
+        assert d["type"] == "scroll_to"
+        assert d["id"] == "gallery1"
+        assert d["destination"]["type"] == "index"
+        assert d["destination"]["value"] == 3
+
+    def test_action_copy_to_clipboard(self):
+        from divkit_rs import ContentText
+
+        a = DivActionCopyToClipboard(content=ContentText(value="copied!"))
+        d = a.dict()
+        assert d["type"] == "copy_to_clipboard"
+        assert d["content"]["type"] == "text"
+        assert d["content"]["value"] == "copied!"
+
+    def test_action_download(self):
+        a = DivActionDownload(url="https://example.com/data")
+        d = a.dict()
+        assert d["type"] == "download"
+        assert d["url"] == "https://example.com/data"
+
+    def test_action_submit(self):
+        a = DivActionSubmit(
+            container_id="form1",
+            request=DivActionSubmitRequest(
+                url="https://api.example.com/submit",
+                method="post",
+                headers=[RequestHeader(name="X-Token", value="abc")],
+            ),
+        )
+        d = a.dict()
+        assert d["type"] == "submit"
+        assert d["container_id"] == "form1"
+        assert d["request"]["url"] == "https://api.example.com/submit"
+        assert d["request"]["method"] == "post"
+        assert len(d["request"]["headers"]) == 1
+        assert d["request"]["headers"][0]["name"] == "X-Token"
+
+    def test_action_timer(self):
+        a = DivActionTimer(id="timer1", action="start")
+        d = a.dict()
+        assert d["type"] == "timer"
+        assert d["id"] == "timer1"
+        assert d["action"] == "start"
+
+    def test_action_video(self):
+        a = DivActionVideo(id="video1", action="start")
+        d = a.dict()
+        assert d["type"] == "video"
+        assert d["id"] == "video1"
+        assert d["action"] == "start"
+
+    # --- Typed actions inside DivAction ---
+
+    def test_typed_action_in_div_action(self):
+        a = DivAction(
+            log_id="set_state_action",
+            typed=DivActionSetState(state_id="0/toggle/on"),
+        )
+        d = a.dict()
+        assert d["log_id"] == "set_state_action"
+        assert d["typed"]["type"] == "set_state"
+        assert d["typed"]["state_id"] == "0/toggle/on"
+
+    # --- DivVideo ---
+
+    def test_div_video(self):
+        v = DivVideo(
+            video_sources=[
+                DivVideoSource(
+                    url="https://example.com/video.mp4",
+                    mime_type="video/mp4",
+                ),
+            ],
+        )
+        d = v.dict()
+        assert d["type"] == "video"
+        assert len(d["video_sources"]) == 1
+        assert d["video_sources"][0]["type"] == "video_source"
+        assert d["video_sources"][0]["mime_type"] == "video/mp4"
+
+    def test_div_video_with_options(self):
+        v = DivVideo(
+            video_sources=[
+                DivVideoSource(
+                    url="https://example.com/video.mp4",
+                    mime_type="video/mp4",
+                ),
+            ],
+            autostart=True,
+            muted=True,
+            repeatable=True,
+        )
+        d = v.dict()
+        assert d["autostart"] is True
+        assert d["muted"] is True
+        assert d["repeatable"] is True
+
+    # --- DivTextRange ---
+
+    def test_div_text_range(self):
+        tr = DivTextRange(
+            start=0,
+            end=5,
+            font_weight="bold",
+            text_color="#ff0000",
+        )
+        d = tr.dict()
+        assert d["start"] == 0
+        assert d["end"] == 5
+        assert d["font_weight"] == "bold"
+        assert d["text_color"] == "#ff0000"
+
+    def test_text_with_ranges(self):
+        t = DivText(
+            text="Hello World",
+            ranges=[
+                DivTextRange(start=0, end=5, font_weight="bold"),
+                DivTextRange(start=6, end=11, text_color="#0000ff"),
+            ],
+        )
+        d = t.dict()
+        assert d["type"] == "text"
+        assert len(d["ranges"]) == 2
+        assert d["ranges"][0]["start"] == 0
+        assert d["ranges"][0]["font_weight"] == "bold"
+        assert d["ranges"][1]["text_color"] == "#0000ff"
+
+    # --- Verify isinstance works on new types ---
+
+    def test_new_types_are_classes(self):
+        assert isinstance(DivActionSetState, type)
+        assert isinstance(DivVideo, type)
+        assert isinstance(DivTextRange, type)
+        assert isinstance(DivActionCopyToClipboard, type)
+
+    def test_new_types_isinstance(self):
+        a = DivActionSetState(state_id="0/s/active")
+        assert isinstance(a, DivActionSetState)
+        assert isinstance(a, PyDivEntity)
+
+        v = DivVideo(video_sources=[])
+        assert isinstance(v, DivVideo)
+        assert isinstance(v, PyDivEntity)
+
+    # --- Bulk import check ---
+
+    def test_all_action_types_importable(self):  # noqa: C901
+        """Every DivAction* type is importable from divkit_rs."""
+        action_types = [
+            "DivActionAnimatorStart",
+            "DivActionAnimatorStop",
+            "DivActionArrayInsertValue",
+            "DivActionArrayRemoveValue",
+            "DivActionArraySetValue",
+            "DivActionClearFocus",
+            "DivActionCopyToClipboard",
+            "DivActionCustom",
+            "DivActionDictSetValue",
+            "DivActionDownload",
+            "DivActionFocusElement",
+            "DivActionHideTooltip",
+            "DivActionMenuItem",
+            "DivActionScrollBy",
+            "DivActionScrollTo",
+            "DivActionSetState",
+            "DivActionSetStoredValue",
+            "DivActionSetVariable",
+            "DivActionShowTooltip",
+            "DivActionSubmit",
+            "DivActionSubmitRequest",
+            "DivActionTimer",
+            "DivActionUpdateStructure",
+            "DivActionVideo",
+        ]
+        for name in action_types:
+            cls = getattr(divkit_rs, name)
+            assert isinstance(cls, type), f"{name} is not a type"
+
+
+# ================================================================
+# P2 — Subclassable classes (template pattern)
+# ================================================================
+
+
+class TestSubclassing:
+    """Subclasses of divkit-rs types should work as template classes."""
+
+    # --- Custom __init__ ---
+
+    def test_subclass_custom_init(self):
+        """Subclass with custom __init__ that passes fields to super()."""
+
+        class TemplateButton(DivContainer):
+            def __init__(self, text="Click", **kwargs):
+                super().__init__(items=[DivText(text=text)], **kwargs)
+
+        b = TemplateButton()
+        d = b.dict()
+        assert d["type"] == "container"
+        assert len(d["items"]) == 1
+        assert d["items"][0]["type"] == "text"
+        assert d["items"][0]["text"] == "Click"
+
+    def test_subclass_custom_init_with_kwargs(self):
+        """Extra kwargs passed through to parent."""
+
+        class TemplateButton(DivContainer):
+            def __init__(self, text="Click", **kwargs):
+                super().__init__(items=[DivText(text=text)], **kwargs)
+
+        b = TemplateButton(text="OK", orientation="vertical")
+        d = b.dict()
+        assert d["orientation"] == "vertical"
+        assert d["items"][0]["text"] == "OK"
+
+    def test_subclass_custom_init_no_kwarg_leak(self):
+        """Kwargs consumed by subclass __init__ do NOT leak into dict()."""
+
+        class TemplateButton(DivContainer):
+            def __init__(self, text="Click", **kwargs):
+                super().__init__(items=[DivText(text=text)], **kwargs)
+
+        b = TemplateButton(text="OK", orientation="vertical")
+        d = b.dict()
+        assert "text" not in d  # consumed by TemplateButton, not a container field
+
+    # --- Class-level defaults ---
+
+    def test_class_level_defaults(self):
+        """Class-level attributes become default field values in dict()."""
+
+        class VerticalContainer(DivContainer):
+            orientation = "vertical"
+
+        c = VerticalContainer(items=[])
+        d = c.dict()
+        assert d["orientation"] == "vertical"
+        assert d["items"] == []
+
+    def test_class_level_defaults_kwargs_override(self):
+        """Explicit kwargs override class-level defaults."""
+
+        class VerticalContainer(DivContainer):
+            orientation = "vertical"
+
+        c = VerticalContainer(items=[], orientation="horizontal")
+        assert c.dict()["orientation"] == "horizontal"
+
+    def test_class_level_defaults_no_extra_fields(self):
+        """Only fields in _field_names are picked up from class attrs."""
+
+        class MyContainer(DivContainer):
+            orientation = "vertical"
+            my_custom_attr = "should_not_appear"
+
+        c = MyContainer(items=[])
+        d = c.dict()
+        assert "my_custom_attr" not in d
+        assert d["orientation"] == "vertical"
+
+    # --- Multi-level inheritance ---
+
+    def test_multi_level_inheritance(self):
+        """Defaults accumulate across multiple inheritance levels."""
+
+        class Card(DivContainer):
+            orientation = "vertical"
+
+        class PaddedCard(Card):
+            clip_to_bounds = True
+
+        pc = PaddedCard(items=[])
+        d = pc.dict()
+        assert d["orientation"] == "vertical"
+        assert d["clip_to_bounds"] is True
+        assert d["items"] == []
+
+    def test_multi_level_override(self):
+        """Subclass defaults override parent defaults."""
+
+        class VerticalContainer(DivContainer):
+            orientation = "vertical"
+
+        class HorizontalContainer(VerticalContainer):
+            orientation = "horizontal"
+
+        c = HorizontalContainer(items=[])
+        assert c.dict()["orientation"] == "horizontal"
+
+    # --- isinstance / type checks ---
+
+    def test_isinstance_chain(self):
+        class Card(DivContainer):
+            orientation = "vertical"
+
+        c = Card(items=[])
+        assert isinstance(c, Card)
+        assert isinstance(c, DivContainer)
+        assert isinstance(c, PyDivEntity)
+
+    def test_not_isinstance_sibling(self):
+        class CardA(DivContainer):
+            pass
+
+        class CardB(DivContainer):
+            pass
+
+        a = CardA(items=[])
+        assert not isinstance(a, CardB)
+
+    # --- __init_subclass__ ---
+
+    def test_init_subclass_hook(self):
+        """__init_subclass__ fires for sub-subclasses."""
+        registry = []
+
+        class TrackedDiv(DivContainer):
+            def __init_subclass__(cls, **kwargs):
+                super().__init_subclass__(**kwargs)
+                registry.append(cls.__name__)
+
+        class Alpha(TrackedDiv):
+            pass
+
+        class Beta(TrackedDiv):
+            pass
+
+        assert registry == ["Alpha", "Beta"]
+
+    # --- __repr__ ---
+
+    def test_repr_shows_subclass_name(self):
+        class MyText(DivText):
+            pass
+
+        t = MyText(text="hello")
+        assert "MyText" in repr(t)
+
+    # --- schema ---
+
+    def test_subclass_schema_includes_parent_fields(self):
+        class Card(DivContainer):
+            orientation = "vertical"
+
+        c = Card(items=[])
+        s = c.schema()
+        assert "items" in s["properties"]
+        assert "orientation" in s["properties"]
+
+    # --- Class metadata accessible ---
+
+    def test_type_name_accessible(self):
+        assert DivContainer._type_name == "container"
+        assert DivText._type_name == "text"
+
+    def test_field_names_accessible(self):
+        assert "items" in DivContainer._field_names
+        assert "orientation" in DivContainer._field_names
+        assert "text" in DivText._field_names
+
+    def test_field_names_inherited(self):
+        class Card(DivContainer):
+            pass
+
+        assert Card._type_name == "container"
+        assert "items" in Card._field_names
+
+    def test_module_like_pass_subclass_stays_template(self):
+        ModuleLikeCard = type(
+            "ModuleLikeCard",
+            (DivContainer,),
+            {"__module__": "module_like.templates"},
+        )
+
+        card = ModuleLikeCard(items=[])
+        assert card.dict()["type"] == ModuleLikeCard.template_name
+        assert ModuleLikeCard.template()["type"] == "container"
+
+    def test_module_like_scalar_defaults_stay_template(self):
+        ModuleLikeText = type(
+            "ModuleLikeText",
+            (DivText,),
+            {"__module__": "module_like.templates", "font_size": 16},
+        )
+
+        text = ModuleLikeText(text="hello")
+        rendered = text.dict()
+
+        assert rendered["type"] == ModuleLikeText.template_name
+        template = ModuleLikeText.template()
+        assert template["type"] == "text"
+        assert template["font_size"] == 16
+
+    # --- Complex template pattern ---
+
+    def test_template_with_nested_defaults(self):
+        """Real-world template pattern: card with header + body."""
+
+        class InfoCard(DivContainer):
+            orientation = "vertical"
+
+            def __init__(self, title, body_items, **kwargs):
+                header = DivText(text=title, font_size=20, font_weight="bold")
+                super().__init__(
+                    items=[header] + body_items,
+                    **kwargs,
+                )
+
+        card = InfoCard(
+            title="Welcome",
+            body_items=[DivText(text="Hello world")],
+            paddings=DivEdgeInsets(left=16, right=16),
+        )
+        d = card.dict()
+        assert d["type"] == "container"
+        assert d["orientation"] == "vertical"
+        assert len(d["items"]) == 2
+        assert d["items"][0]["text"] == "Welcome"
+        assert d["items"][0]["font_size"] == 20
+        assert d["items"][1]["text"] == "Hello world"
+        assert d["paddings"]["left"] == 16
+
+
+class TestPydivkitCompatibilityLayer:
+    def test_pydivkit_namespace_alias_imports(self):
+        import pydivkit as dk
+        from pydivkit.core import Expr
+
+        assert dk.DivText is divkit_rs.DivText
+        assert str(Expr("@{value}")) == "@{value}"
+
+    def test_core_exports_exist(self):
+        assert hasattr(divkit_rs, "Field")
+        assert hasattr(divkit_rs, "Ref")
+        assert hasattr(divkit_rs, "Expr")
+        assert hasattr(divkit_rs, "BaseEntity")
+        assert hasattr(divkit_rs, "BaseDiv")
+
+    def test_native_compat_dump_expr(self):
+        from divkit_rs._native import compat_dump
+
+        dumped = compat_dump(divkit_rs.Expr("@{value}"))
+        assert dumped == "@{value}"
+
+    def test_native_compat_dump_custom_mapping(self):
+        from divkit_rs._native import compat_dump
+
+        dumped = compat_dump(_CustomMapping({"text": divkit_rs.Expr("@{value}"), "n": 1}))
+        assert dumped == {"text": "@{value}", "n": 1}
+
+    def test_native_compat_dump_custom_sequence(self):
+        from divkit_rs._native import compat_dump
+
+        dumped = compat_dump(
+            _CustomSequence([divkit_rs.Expr("@{value}"), {"value": divkit_rs.Expr("@{x}")}, 2])
+        )
+        assert dumped == ["@{value}", {"value": "@{x}"}, 2]
+
+    def test_native_compat_dump_bytes_passthrough(self):
+        from divkit_rs._native import compat_dump
+
+        dumped = compat_dump(b"abc")
+        assert dumped == b"abc"
+
+    def test_native_normalize_pydivkit_json_rules(self):
+        from divkit_rs._native import normalize_pydivkit_json
+
+        normalized = normalize_pydivkit_json(
+            {
+                "top_left": 1,
+                "$bottom_right": "x",
+                "alpha": 1,
+                "ratio": 2,
+                "weight": 3,
+                "letter_spacing": 4,
+                "x": {"value": 5},
+                "y": {"value": 6},
+                "stroke": {"width": 7},
+                "color": 123,
+            }
+        )
+
+        assert normalized["top-left"] == 1
+        assert normalized["$bottom-right"] == "x"
+        assert normalized["alpha"] == 1.0
+        assert normalized["ratio"] == 2.0
+        assert normalized["weight"] == 3.0
+        assert normalized["letter_spacing"] == 4.0
+        assert normalized["x"]["value"] == 5.0
+        assert normalized["y"]["value"] == 6.0
+        assert normalized["stroke"]["width"] == 7.0
+        assert normalized["color"] == "123"
+
+    def test_native_normalize_pydivkit_json_keeps_bools(self):
+        from divkit_rs._native import normalize_pydivkit_json
+
+        normalized = normalize_pydivkit_json({"alpha": True, "x": {"value": True}})
+        assert normalized["alpha"] is True
+        assert normalized["x"]["value"] is True
+
+    def test_class_level_schema_call(self):
+        schema = DivText.schema()
+        assert "properties" in schema
+        assert "text" in schema["properties"]
+
+    def test_legacy_field_names_mapping_exists(self):
+        class StyledContainer(DivContainer):
+            extra: str | None = Field(default=None)
+
+        field_names = StyledContainer.__field_names__
+        assert hasattr(field_names, "values")
+        values = set(field_names.values())
+        assert "items" in values
+        assert "extra" in values
+
+    def test_template_style_field_ref(self):
+        class Header(DivContainer):
+            title: str = Field()
+            title_color: str = Field()
+            items = [DivText(text=Ref(title), text_color=Ref(title_color))]
+
+        header = Header(title="Hello", title_color="#ffffff")
+        rendered = header.dict()
+        assert rendered["type"] == Header.template_name
+        assert rendered["title"] == "Hello"
+        assert rendered["title_color"] == "#ffffff"
+
+        templates = {tpl.template_name: tpl.template() for tpl in header.related_templates()}
+        assert Header.template_name in templates
+        template = templates[Header.template_name]
+        assert template["type"] == "container"
+        assert template["items"][0]["$text"] == "title"
+        assert template["items"][0]["$text_color"] == "title_color"
+
+    def test_template_schema_contains_declared_fields(self):
+        class Header(DivContainer):
+            title: str = Field(description="Header title")
+            tags: list[str] = Field(default=["a"], min_items=1)
+            items = [DivText(text=Ref(title))]
+
+        schema = Header.schema()
+        props = schema["properties"]
+
+        assert props["title"]["type"] == "string"
+        assert props["title"]["description"] == "Header title"
+        assert "title" not in schema.get("required", [])
+        assert props["tags"]["type"] == "array"
+        assert props["tags"]["minItems"] == 1
+        assert props["tags"]["default"] == ["a"]
+        assert "tags" not in schema.get("required", [])
+
+        schema_without_tags = Header.schema(exclude_fields=["tags"])
+        assert "tags" not in schema_without_tags["properties"]
+
+    def test_make_div_collects_templates(self):
+        class Header(DivContainer):
+            title: str = Field()
+            items = [DivText(text=Ref(title))]
+
+        header = Header(title="Hello")
+        result = divkit_rs.make_div(header)
+        assert Header.template_name in result["templates"]
+        assert result["card"]["states"][0]["div"]["type"] == Header.template_name
+
+    def test_make_div_collects_module_like_pass_template(self):
+        ModuleLikeCard = type(
+            "ModuleLikeCard",
+            (DivContainer,),
+            {"__module__": "module_like.templates"},
+        )
+
+        root = DivContainer(items=[ModuleLikeCard(items=[])])
+        result = divkit_rs.make_div(root)
+
+        assert ModuleLikeCard.template_name in result["templates"]
+        assert result["templates"][ModuleLikeCard.template_name]["type"] == "container"
+
+    def test_make_div_collects_module_like_scalar_template(self):
+        ModuleLikeText = type(
+            "ModuleLikeText",
+            (DivText,),
+            {"__module__": "module_like.templates", "font_size": 16},
+        )
+
+        root = DivContainer(items=[ModuleLikeText(text="hello")])
+        result = divkit_rs.make_div(root)
+
+        assert ModuleLikeText.template_name in result["templates"]
+        assert result["templates"][ModuleLikeText.template_name]["type"] == "text"
+        assert result["templates"][ModuleLikeText.template_name]["font_size"] == 16
+
+    def test_make_div_collects_transitive_template_dependencies(self):
+        class LeafTpl(DivText):
+            ranges = []
+
+        class MidTpl(DivContainer):
+            items = [{"type": LeafTpl.template_name}]
+
+        class RootTpl(DivContainer):
+            items = [{"type": MidTpl.template_name}]
+
+        root = DivContainer(items=[RootTpl(items=[])])
+        result = divkit_rs.make_div(root)
+
+        assert RootTpl.template_name in result["templates"]
+        assert MidTpl.template_name in result["templates"]
+        assert LeafTpl.template_name in result["templates"]
+
+    def test_make_card_accepts_multiple_divs(self):
+        card = divkit_rs.make_card(
+            "card",
+            DivText(text="first"),
+            DivText(text="second"),
+        ).dict()
+
+        assert card["log_id"] == "card"
+        assert card["states"][0]["state_id"] == 0
+        assert card["states"][0]["div"]["text"] == "first"
+        assert card["states"][1]["state_id"] == 1
+        assert card["states"][1]["div"]["text"] == "second"
+
+    def test_make_card_returns_divdata_instance(self):
+        card = divkit_rs.make_card("card", DivText(text="first"))
+
+        assert isinstance(card, divkit_rs.DivData)
+        assert card.dict()["states"][0]["div"]["text"] == "first"
+
+    def test_make_card_accepts_divs_keyword_and_variables_container(self):
+        class DivVarDataStub:
+            variables = [{"name": "x", "type": "string", "value": "1"}]
+            variable_triggers = [{"actions": [{"log_id": "trigger"}]}]
+            timers = [{"id": "timer"}]
+
+        card = divkit_rs.make_card(
+            "card",
+            divs=[DivText(text="first")],
+            variables=DivVarDataStub(),
+        ).dict()
+
+        assert card["states"][0]["div"]["text"] == "first"
+        assert card["variables"] == [{"name": "x", "type": "string", "value": "1"}]
+        assert card["variable_triggers"] == [{"actions": [{"log_id": "trigger"}]}]
+        assert card["timers"] == [{"id": "timer"}]
+
+    def test_make_card_accepts_pydiventity_variables_container(self):
+        class DivVarDataStub(BaseDiv):
+            pass
+
+        data = DivVarDataStub()
+        card = divkit_rs.make_card(
+            "card",
+            divs=[DivText(text="first")],
+            variables=data,
+        ).dict()
+
+        assert card["states"][0]["div"]["text"] == "first"
+        assert card["variables"] == []
+        assert card["variable_triggers"] == []
+        assert card["timers"] == []
+
+    def test_make_card_rejects_mixed_positional_and_divs_keyword(self):
+        with pytest.raises(
+            TypeError,
+            match="Provide either positional divs or `divs=` keyword, not both",
+        ):
+            divkit_rs.make_card(
+                "card",
+                DivText(text="first"),
+                divs=[DivText(text="second")],
+            )
+
+    def test_actions_getattr_returns_entities(self):
+        text = DivText(
+            text="hello",
+            actions=[DivAction(log_id="log", url="div-action://set_state?state_id=0")],
+        )
+
+        actions = getattr(text, "actions")
+
+        assert len(actions) == 1
+        assert isinstance(actions[0], DivAction)
+        assert actions[0].dict()["log_id"] == "log"
+
+    def test_action_singular_getattr_returns_entity(self):
+        img = DivImage(
+            image_url="https://example.com/icon.png",
+            action=DivAction(log_id="menu_{hash}", url="div-action://open"),
+        )
+
+        action = getattr(img, "action", None)
+
+        assert action is not None
+        assert isinstance(action, DivAction)
+        assert action.dict()["log_id"] == "menu_{hash}"
+
+    def test_visibility_action_singular_getattr_returns_entity(self):
+        text = DivText(
+            text="hello",
+            visibility_action=DivVisibilityAction(
+                log_id="appear_{hash}",
+                visibility_percentage=50,
+            ),
+        )
+
+        va = getattr(text, "visibility_action", None)
+
+        assert va is not None
+        assert isinstance(va, DivVisibilityAction)
+        assert va.dict()["log_id"] == "appear_{hash}"
+
+    def test_visibility_actions_plural_getattr_returns_entities(self):
+        text = DivText(
+            text="hello",
+            visibility_actions=[
+                DivVisibilityAction(log_id="appear_1"),
+                DivVisibilityAction(log_id="appear_2"),
+            ],
+        )
+
+        vas = getattr(text, "visibility_actions")
+
+        assert len(vas) == 2
+        assert all(isinstance(v, DivVisibilityAction) for v in vas)
+        assert vas[0].dict()["log_id"] == "appear_1"
+        assert vas[1].dict()["log_id"] == "appear_2"
+
+    def test_tuple_background_serializes_as_list(self):
+        container = DivContainer(
+            items=[],
+            background=(DivSolidBackground(color="#ffffff"),),
+        )
+
+        rendered = container.dict()
+        assert isinstance(rendered["background"], list)
+        assert rendered["background"][0] == {"type": "solid", "color": "#ffffff"}
+
+    def test_make_div_collects_nested_templates_from_tuple_states(self):
+        class TransparentCard(DivContainer):
+            items = []
+
+        class SkeletonTabs(DivTabs):
+            items = [
+                DivTabsItem(
+                    title="tab",
+                    div=DivState(
+                        states=(
+                            DivStateState(
+                                state_id="default",
+                                div=TransparentCard(),
+                            ),
+                        ),
+                    ),
+                )
+            ]
+
+        root = DivContainer(items=[SkeletonTabs()])
+        result = divkit_rs.make_div(root)
+        assert TransparentCard.template_name in result["templates"]
+        skeleton_div = result["card"]["states"][0]["div"]["items"][0]
+        assert skeleton_div["type"] == SkeletonTabs.template_name
+
+    def test_make_div_updates_dependencies_after_late_template_registration(self):
+        Root = type(
+            "Root",
+            (DivContainer,),
+            {
+                "__module__": "late.module",
+                "items": [{"type": "late.module.LateTpl"}],
+            },
+        )
+
+        result_before = divkit_rs.make_div(Root())
+        assert "late.module.LateTpl" not in result_before["templates"]
+
+        LateTpl = type(
+            "LateTpl",
+            (DivText,),
+            {"__module__": "late.module"},
+        )
+
+        result_after = divkit_rs.make_div(Root())
+        assert LateTpl.template_name in result_after["templates"]
+        assert result_after["templates"][LateTpl.template_name]["type"] == "text"
+
+    def test_related_templates_updates_after_late_template_registration(self):
+        Root = type(
+            "RootRelated",
+            (DivContainer,),
+            {
+                "__module__": "late.related.module",
+                "items": [{"type": "late.related.module.LateTpl"}],
+            },
+        )
+
+        related_before = Root().related_templates()
+        assert all(
+            template.template_name != "late.related.module.LateTpl" for template in related_before
+        )
+
+        LateTpl = type(
+            "LateTpl",
+            (DivText,),
+            {"__module__": "late.related.module"},
+        )
+
+        related_after = Root().related_templates()
+        assert LateTpl in related_after
+
+    def test_related_templates_cached_result_is_not_mutated_by_caller(self):
+        class Header(DivContainer):
+            items = []
+
+        root = DivContainer(items=[Header(items=[])])
+        related = root.related_templates()
+        assert Header in related
+
+        # Cache returns an isolated set, so caller mutation does not leak.
+        related.add(DivText)
+        assert DivText not in root.related_templates()
+
+    def test_related_templates_collects_mixed_constructor_values(self):
+        class LeafTpl(DivText):
+            ranges = []
+
+        class MidTpl(DivContainer):
+            items = [{"type": LeafTpl.template_name}]
+
+        root = DivContainer(items=[])
+        root._set_constructor_values(
+            {
+                "tpl_type": MidTpl,
+                "tpl_entity": MidTpl(items=[]),
+                "tpl_dict": {
+                    "type": MidTpl.template_name,
+                    "items": [{"type": LeafTpl.template_name}],
+                },
+                "tpl_list": [MidTpl(items=[]), {"type": LeafTpl.template_name}],
+            }
+        )
+
+        related = root.related_templates()
+        assert MidTpl in related
+        assert LeafTpl in related
+
+    def test_div_module_namespaces(self):
+        import divkit_rs.div as div
+
+        assert div.div_timer.DivTimer is divkit_rs.DivTimer
+        assert div.div_trigger.DivTrigger is divkit_rs.DivTrigger
+        assert div.div_variable.DivVariable is divkit_rs.DivVariable
+        assert div.div_variable.StringVariable is divkit_rs.StringVariable
+
+    def test_base_div_alias(self):
+        assert issubclass(DivContainer, BaseDiv)
+
+    def test_custom_base_div_inheritance(self):
+        class DivVarData(BaseDiv):
+            timers: list[str] | None = Field(description="List of timers")
+
+        assert issubclass(DivVarData, BaseDiv)
+        schema = DivVarData.schema()
+        assert "timers" in schema["properties"]
+        assert schema["properties"]["timers"]["description"] == "List of timers"
+
+    def test_custom_base_div_super_init_accepts_kwargs(self):
+        class DivVarData(BaseDiv):
+            timers: list[str] | None = Field(default=None)
+            variable_triggers: list[str] | None = Field(default=None)
+            variables: list[str] | None = Field(default=None)
+
+            def __init__(
+                self,
+                *,
+                timers: list[str] | None = None,
+                variable_triggers: list[str] | None = None,
+                variables: list[str] | None = None,
+                **kwargs,
+            ):
+                super().__init__(
+                    timers=timers,
+                    variable_triggers=variable_triggers,
+                    variables=variables,
+                    **kwargs,
+                )
+
+        data = DivVarData(
+            timers=["timer"],
+            variable_triggers=["trigger"],
+            variables=["var"],
+            custom="x",
+        )
+        assert data.timers == ["timer"]
+        assert data.variable_triggers == ["trigger"]
+        assert data.variables == ["var"]
+        assert data.custom == "x"
+
+    def test_none_list_kwargs_behave_as_unset_fields(self):
+        container = DivContainer(items=[], actions=None)
+
+        assert container.actions is None
+        assert "actions" not in container.dict()
+
+    def test_base_pydiventity_kwargs_and_getattr_do_not_fail(self):
+        base = PyDivEntity(foo="bar", n=3)
+
+        assert base.foo == "bar"
+        assert base.n == 3
+        assert base.dict()["foo"] == "bar"
+        assert base.related_templates() == set()
+
+    def test_nested_entity_attr_mutation_after_constructor(self):
+        container = DivContainer(items=[], margins=DivEdgeInsets(right=8))
+
+        container.margins.top = 4
+
+        assert container.dict()["margins"] == {"right": 8, "top": 4}
+
+    def test_nested_entity_attr_mutation_after_dict_setattr(self):
+        container = DivContainer(items=[])
+        container.margins = {"right": 6}
+
+        container.margins.top = 2
+
+        assert container.dict()["margins"] == {"right": 6, "top": 2}
+
+    def test_unset_optional_field_returns_none(self):
+        container = DivContainer(items=[])
+        assert container.column_span is None
+
+    def test_unknown_field_raises_attribute_error(self):
+        container = DivContainer(items=[])
+        with pytest.raises(AttributeError):
+            _ = container.totally_unknown_field
+
+    def test_unset_field_isinstance_pattern(self):
+        container = DivContainer(items=[])
+        result = container.column_span if isinstance(container.column_span, int) else 1
+        assert result == 1
+
+
+class TestCopySupport:
+    def test_copy_simple(self):
+        original = DivText(text="hello", font_size=14)
+        cloned = copy(original)
+        assert cloned is not original
+        assert cloned.dict() == original.dict()
+
+    def test_copy_preserves_type(self):
+        original = DivText(text="hello")
+        cloned = copy(original)
+        assert type(cloned) is DivText
+
+    def test_copy_with_enum_fields(self):
+        original = DivText(text="hi", visibility=DivVisibility.INVISIBLE)
+        cloned = copy(original)
+        assert cloned.visibility == DivVisibility.INVISIBLE
+
+    def test_copy_nested(self):
+        original = DivContainer(items=[DivText(text="a"), DivText(text="b")])
+        cloned = copy(original)
+        assert cloned.dict() == original.dict()
+        assert cloned is not original
+
+    def test_deepcopy_simple(self):
+        original = DivText(text="hello", font_size=14)
+        cloned = deepcopy(original)
+        assert cloned is not original
+        assert cloned.dict() == original.dict()
+
+    def test_deepcopy_nested(self):
+        original = DivContainer(items=[DivText(text="a")])
+        cloned = deepcopy(original)
+        assert cloned.dict() == original.dict()
+        assert cloned is not original
+
+
+class TestRawDictCoercion:
+    """When entities are passed as raw dicts (not PyDivEntity), schema coercion must recurse."""
+
+    def test_border_dict_has_shadow_int_coerced_to_bool(self):
+        d = DivContainer(items=[], border={"has_shadow": 1}).dict()
+        assert d["border"]["has_shadow"] is True
+
+    def test_border_dict_shadow_alpha_int_coerced_to_float(self):
+        d = DivContainer(
+            items=[],
+            border={"shadow": {"alpha": 1, "offset": {"x": {"value": 0}, "y": {"value": -2}}}},
+        ).dict()
+        assert isinstance(d["border"]["shadow"]["alpha"], float)
+        assert d["border"]["shadow"]["alpha"] == 1.0
+
+    def test_border_dict_shadow_offset_value_int_coerced_to_float(self):
+        d = DivContainer(
+            items=[],
+            border={"shadow": {"alpha": 1, "offset": {"x": {"value": 0}, "y": {"value": -2}}}},
+        ).dict()
+        assert isinstance(d["border"]["shadow"]["offset"]["x"]["value"], float)
+        assert isinstance(d["border"]["shadow"]["offset"]["y"]["value"], float)
+        assert d["border"]["shadow"]["offset"]["y"]["value"] == -2.0
+
+    def test_action_dict_is_enabled_string_coerced_to_bool(self):
+        d = DivText(text="hi", actions=[{"is_enabled": "True", "log_id": "x"}]).dict()
+        assert d["actions"][0]["is_enabled"] is True
+
+    def test_corners_radius_dict_keys_hyphenated(self):
+        d = DivContainer(
+            items=[], border={"corners_radius": {"top_left": 24, "top_right": 24}}
+        ).dict()
+        cr = d["border"]["corners_radius"]
+        assert "top-left" in cr, f"expected top-left, got keys: {list(cr.keys())}"
+        assert "top-right" in cr
+
+
+class TestMultiRefCoercion:
+    """Coercion inside discriminated union fields (AnyOf with multiple Refs)."""
+
+    def test_boolean_value_int_coerced_to_bool(self):
+        """BooleanValue.value: Int(0) → Bool(false) when passed as raw dict."""
+        d = DivActionSetVariable(
+            variable_name="flag",
+            value={"type": "boolean", "value": 0},
+        ).dict()
+        assert d["value"]["value"] is False
+
+    def test_boolean_value_int_1_coerced_to_true(self):
+        d = DivActionSetVariable(
+            variable_name="flag",
+            value={"type": "boolean", "value": 1},
+        ).dict()
+        assert d["value"]["value"] is True
+
+    def test_integer_value_str_coerced_to_int(self):
+        """IntegerValue.value: String("42") → Int(42) when passed as raw dict."""
+        d = DivActionSetVariable(
+            variable_name="tab",
+            value={"type": "integer", "value": "42"},
+        ).dict()
+        assert d["value"]["value"] == 42
+        assert type(d["value"]["value"]) is int
+
+    def test_nested_in_action_typed(self):
+        """Full chain: DivAction.typed → set_variable → BooleanValue."""
+        d = DivAction(
+            log_id="test",
+            typed={
+                "type": "set_variable",
+                "variable_name": "loading",
+                "value": {"type": "boolean", "value": 0},
+            },
+        ).dict()
+        assert d["typed"]["value"]["value"] is False
+
+    def test_nested_integer_in_action_typed(self):
+        d = DivAction(
+            log_id="test",
+            typed={
+                "type": "set_variable",
+                "variable_name": "selected_tab",
+                "value": {"type": "integer", "value": "1"},
+            },
+        ).dict()
+        assert d["typed"]["value"]["value"] == 1
+        assert type(d["typed"]["value"]["value"]) is int

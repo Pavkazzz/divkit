@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import uuid
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
+from typing import Any, get_args, get_origin
+
+from divkit_rs._native import (
+    DivAction as NativeDivAction,
+)
+from divkit_rs._native import (
+    DivData as NativeDivData,
+)
+from divkit_rs._native import (
+    DivEdgeInsets as NativeDivEdgeInsets,
+)
+from divkit_rs._native import (
+    DivVisibilityAction as NativeDivVisibilityAction,
+)
+from divkit_rs._native import (
+    PyDivData as NativePyDivData,
+)
+from divkit_rs._native import (
+    PyDivEntity,
+)
+from divkit_rs._native import (
+    compat_dump as _compat_dump_native,
+)
+from divkit_rs._native import (
+    compat_make_card as _compat_make_card_native,
+)
+from divkit_rs._native import (
+    normalize_pydivkit_json as _normalize_pydivkit_json,
+)
+from divkit_rs._native import (
+    register_type_meta as _register_type_meta,
+)
+
+from .core.compat import classproperty
+from .core.fields import REF_MARKER_PREFIX, _Field
+
+
+def _is_ref_marker(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(REF_MARKER_PREFIX)
+
+
+def _extract_ref_uid(value: str) -> str:
+    return value[len(REF_MARKER_PREFIX) :]
+
+
+def _replace_ref_markers(value: Any, uid_to_name: Mapping[str, str]) -> Any:
+    if isinstance(value, list):
+        return [_replace_ref_markers(v, uid_to_name) for v in value]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if _is_ref_marker(item):
+                ref_uid = _extract_ref_uid(item)
+                result[f"${key}"] = uid_to_name.get(ref_uid, ref_uid)
+            else:
+                result[key] = _replace_ref_markers(item, uid_to_name)
+        return result
+    return value
+
+
+def _is_tracked_constructor_value(value: Any) -> bool:
+    return isinstance(value, PyDivEntity)
+
+
+def _iter_entity_classes(root: type[PyDivEntity]) -> list[type[PyDivEntity]]:
+    out: list[type[PyDivEntity]] = []
+    queue = [root]
+    visited: set[type[PyDivEntity]] = set()
+    while queue:
+        cls = queue.pop()
+        if cls in visited:
+            continue
+        visited.add(cls)
+        out.append(cls)
+        queue.extend(cls.__subclasses__())
+    return out
+
+
+def _install_constructor_compat() -> None:
+    for cls in _iter_entity_classes(PyDivEntity):
+        if cls is PyDivEntity:
+            continue
+        if getattr(cls, "__dk_constructor_compat__", False):
+            continue
+        original_new = cls.__new__
+
+        def _wrapped_new(entity_cls, *args, __orig_new=original_new, **kwargs):
+            instance = __orig_new(entity_cls, *args, **kwargs)
+            tracked_constructor_values = {
+                key: value for key, value in kwargs.items() if _is_tracked_constructor_value(value)
+            }
+            if tracked_constructor_values:
+                instance._set_constructor_values(tracked_constructor_values)
+            return instance
+
+        cls.__new__ = staticmethod(_wrapped_new)
+        cls.__dk_constructor_compat__ = True
+
+
+_dump = _compat_dump_native
+
+
+def _collect_template_names_from_json(value: Any, out: set[str]) -> None:
+    if isinstance(value, dict):
+        type_name = value.get("type")
+        if isinstance(type_name, str):
+            out.add(type_name)
+        for item in value.values():
+            _collect_template_names_from_json(item, out)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_template_names_from_json(item, out)
+
+
+def _collect_related_templates_from_value(value: Any, out: set[type[PyDivEntity]]) -> None:
+    if isinstance(value, type) and issubclass(value, PyDivEntity):
+        out.add(value)
+        return
+    if isinstance(value, PyDivEntity):
+        out.update(value.related_templates())
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            _collect_related_templates_from_value(item, out)
+        return
+    if isinstance(value, dict):
+        type_name = value.get("type")
+        if isinstance(type_name, str):
+            template_cls = _TEMPLATE_REGISTRY.get(type_name)
+            if template_cls is not None:
+                out.add(template_cls)
+        for item in value.values():
+            _collect_related_templates_from_value(item, out)
+
+
+def _annotation_to_schema(annotation: Any) -> dict[str, Any]:
+    if annotation is Any:
+        return {}
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is not None:
+        if origin in (list, tuple, set, frozenset, Sequence):
+            item_schema = _annotation_to_schema(args[0]) if args else {}
+            result: dict[str, Any] = {"type": "array"}
+            if item_schema:
+                result["items"] = item_schema
+            return result
+
+        if origin in (dict, Mapping):
+            return {"type": "object"}
+
+        # Optional[T] / T | None
+        if type(None) in args:
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            if len(non_none_args) == 1:
+                base = _annotation_to_schema(non_none_args[0])
+                if not base:
+                    return {}
+                base = dict(base)
+                current_type = base.get("type")
+                if isinstance(current_type, str):
+                    base["type"] = [current_type, "null"]
+                elif isinstance(current_type, list):
+                    if "null" not in current_type:
+                        base["type"] = [*current_type, "null"]
+                else:
+                    base["type"] = ["null"]
+                return base
+            return {}
+
+    if annotation is str:
+        return {"type": "string"}
+    if annotation is bool:
+        return {"type": "boolean"}
+    if annotation is int:
+        return {"type": "integer"}
+    if annotation is float:
+        return {"type": "number"}
+
+    return {}
+
+
+def _field_is_excluded(field_name: str, exclude_fields: list[str] | None) -> bool:
+    if not exclude_fields:
+        return False
+    return any(
+        exclude_path == field_name or exclude_path.startswith(f"{field_name}.")
+        for exclude_path in exclude_fields
+    )
+
+
+def _apply_template_schema_fields(
+    cls: type[PyDivEntity],
+    schema: dict[str, Any],
+    exclude_fields: list[str] | None,
+) -> dict[str, Any]:
+    declared_fields: Mapping[str, _Field] = getattr(cls, "__dk_fields__", {})
+    if not declared_fields:
+        return schema
+
+    properties = dict(schema.get("properties", {}))
+    required = list(schema.get("required", []))
+    annotations = dict(getattr(cls, "__annotations__", {}))
+
+    for field_name, field in declared_fields.items():
+        if _field_is_excluded(field_name, exclude_fields):
+            properties.pop(field_name, None)
+            if field_name in required:
+                required.remove(field_name)
+            continue
+
+        field_schema = _annotation_to_schema(annotations.get(field_name, Any))
+        if field.description is not None:
+            field_schema["description"] = field.description
+        if field.default is not None:
+            field_schema["default"] = _dump(field.default)
+        if field.constraints:
+            field_schema.update(field.constraints)
+
+        properties[field_name] = field_schema
+        if field.default is None and not field.is_ref:
+            if field_name not in required:
+                required.append(field_name)
+        elif field_name in required:
+            required.remove(field_name)
+
+    schema["properties"] = properties
+    if required:
+        schema["required"] = required
+    else:
+        schema.pop("required", None)
+    return schema
+
+
+class _DualMethod:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def __get__(self, obj, owner):
+        target = owner if obj is None else obj
+
+        def _bound(*args, **kwargs):
+            return self._fn(target, *args, **kwargs)
+
+        return _bound
+
+
+_ORIG_DICT = PyDivEntity.dict
+_ORIG_INIT = PyDivEntity.__init__
+_ORIG_SCHEMA = PyDivEntity.schema
+_ORIG_INIT_SUBCLASS = PyDivEntity.__init_subclass__
+_ORIG_GETATTRIBUTE = PyDivEntity.__getattribute__
+
+_TEMPLATE_REGISTRY: dict[str, type[PyDivEntity]] = {}
+_TEMPLATE_DEPENDENCY_CACHE: dict[type[PyDivEntity], frozenset[type[PyDivEntity]]] = {}
+
+
+def _template_name_for_class(cls: type[PyDivEntity]) -> str:
+    template_name = getattr(cls, "__template_name__", None)
+    if template_name is not None:
+        return template_name
+    return f"{cls.__module__}.{cls.__name__}"
+
+
+def _legacy_field_uid(cls: type[PyDivEntity], field_name: str) -> uuid.UUID:
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{cls.__module__}.{cls.__qualname__}:{field_name}",
+    )
+
+
+def _legacy_field_names_for_class(cls: type[PyDivEntity]) -> Mapping[uuid.UUID, str]:
+    names: dict[uuid.UUID, str] = {}
+
+    for field_name in getattr(cls, "_field_names", []) or []:
+        names[_legacy_field_uid(cls, field_name)] = field_name
+
+    for field_name, field in getattr(cls, "__dk_fields__", {}).items():
+        uid = getattr(field, "uid", None)
+        if not isinstance(uid, uuid.UUID):
+            uid = _legacy_field_uid(cls, field_name)
+        names[uid] = field_name
+
+    return MappingProxyType(names)
+
+
+def _install_field_names_compat() -> None:
+    for cls in _iter_entity_classes(PyDivEntity):
+        cls.__field_names__ = _legacy_field_names_for_class(cls)
+
+
+def _collect_parent_template_classes(
+    cls: type[PyDivEntity],
+    out: set[type[PyDivEntity]],
+) -> None:
+    current_base_type = getattr(cls, "__dk_base_type__", None)
+    visited: set[str] = set()
+    while isinstance(current_base_type, str) and current_base_type not in visited:
+        visited.add(current_base_type)
+        base_template_cls = _TEMPLATE_REGISTRY.get(current_base_type)
+        if base_template_cls is None:
+            break
+        out.add(base_template_cls)
+        current_base_type = getattr(base_template_cls, "__dk_base_type__", None)
+
+
+def _template_dependency_closure(
+    template_cls: type[PyDivEntity],
+) -> frozenset[type[PyDivEntity]]:
+    cached = _TEMPLATE_DEPENDENCY_CACHE.get(template_cls)
+    if cached is not None:
+        return cached
+
+    closure: set[type[PyDivEntity]] = set()
+    queue: list[type[PyDivEntity]] = [template_cls]
+    while queue:
+        current_cls = queue.pop()
+        if current_cls in closure:
+            continue
+        closure.add(current_cls)
+
+        parent_templates: set[type[PyDivEntity]] = set()
+        _collect_parent_template_classes(current_cls, parent_templates)
+        for parent_template_cls in parent_templates:
+            if parent_template_cls not in closure:
+                queue.append(parent_template_cls)
+
+        if not getattr(current_cls, "__dk_is_template__", False):
+            continue
+
+        template_body = current_cls.template()
+        template_names: set[str] = set()
+        _collect_template_names_from_json(template_body, template_names)
+        for template_name in template_names:
+            nested_template_cls = _TEMPLATE_REGISTRY.get(template_name)
+            if nested_template_cls is not None and nested_template_cls not in closure:
+                queue.append(nested_template_cls)
+
+    frozen = frozenset(closure)
+    _TEMPLATE_DEPENDENCY_CACHE[template_cls] = frozen
+    return frozen
+
+
+def _is_template_field_value(value: Any) -> bool:
+    if isinstance(value, type) and issubclass(value, PyDivEntity):
+        return True
+    if isinstance(value, PyDivEntity):
+        return True
+    if isinstance(value, Mapping):
+        return True
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return True
+    return False
+
+
+def _collect_inherited_class_defaults(
+    cls: type[PyDivEntity],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for base in reversed(cls.__mro__[1:]):
+        merged.update(getattr(base, "__dk_defaults__", {}))
+    return merged
+
+
+def _compat_init_subclass(cls: type[PyDivEntity], **kwargs: Any) -> None:
+    try:
+        _ORIG_INIT_SUBCLASS(**kwargs)
+    except TypeError:
+        try:
+            _ORIG_INIT_SUBCLASS(cls, **kwargs)
+        except Exception:
+            pass
+
+    annotations = dict(getattr(cls, "__annotations__", {}))
+    declared_fields: dict[str, _Field] = {}
+    for name in annotations:
+        value = cls.__dict__.get(name)
+        if isinstance(value, _Field):
+            if value.name is None:
+                value.name = name
+            declared_fields[name] = value
+            delattr(cls, name)
+
+    cls.__dk_fields__ = MappingProxyType(declared_fields)
+    cls.__field_names__ = _legacy_field_names_for_class(cls)
+    cls.__dk_tpl_values__ = MappingProxyType({})
+    cls.__dk_defaults__ = MappingProxyType({})
+    cls.__dk_template__ = None
+    cls.__dk_is_template__ = False
+    cls.__dk_base_type__ = getattr(cls, "_type_name", None)
+
+    if not cls.__dk_base_type__:
+        return
+
+    native_field_names = set(getattr(cls, "_field_names", []))
+    inherited_dk_field_names: set[str] = set()
+    for base in cls.__mro__[1:]:
+        inherited_dk_field_names.update(getattr(base, "__dk_fields__", {}).keys())
+
+    class_field_values: dict[str, Any] = {}
+    for name, value in list(cls.__dict__.items()):
+        if name in native_field_names or name in inherited_dk_field_names:
+            class_field_values[name] = value
+            delattr(cls, name)
+
+    inherited_defaults = _collect_inherited_class_defaults(cls)
+    template_like_values = {
+        name: value for name, value in class_field_values.items() if _is_template_field_value(value)
+    }
+
+    class_defined_locally = "<locals>" in getattr(cls, "__qualname__", "")
+    module_level_template = not class_defined_locally
+
+    if declared_fields or template_like_values or module_level_template:
+        cls.__dk_tpl_values__ = MappingProxyType(class_field_values)
+        cls.__dk_is_template__ = True
+        cls.__dk_defaults__ = MappingProxyType({})
+        template_name = _template_name_for_class(cls)
+        _TEMPLATE_REGISTRY[template_name] = cls
+        _TEMPLATE_DEPENDENCY_CACHE.clear()
+        PyDivEntity._bump_related_templates_cache_epoch()
+
+        # Keep template type in nested native serialization.
+        # The original base type is preserved in __dk_base_type__ and used by template().
+        cls._type_name = template_name
+
+        # Register in Rust type_meta cache for fast _configure() lookup.
+        _register_type_meta(
+            f"{cls.__module__}.{cls.__name__}",
+            cls._type_name,
+            list(getattr(cls, "_field_names", [])),
+            list(getattr(cls, "_required_fields", [])),
+        )
+        return
+
+    inherited_defaults.update(class_field_values)
+    cls.__dk_defaults__ = MappingProxyType(inherited_defaults)
+
+    # Register in Rust type_meta cache for fast _configure() lookup.
+    _register_type_meta(
+        f"{cls.__module__}.{cls.__name__}",
+        getattr(cls, "_type_name", None),
+        list(getattr(cls, "_field_names", [])),
+        list(getattr(cls, "_required_fields", [])),
+    )
+
+
+def _compat_entity_init(self: PyDivEntity, **kwargs: Any) -> None:
+    # Generated native entities define their own __init__, so this initializer
+    # primarily serves lightweight user subclasses of BaseDiv/BaseEntity.
+    try:
+        _ORIG_INIT(self)
+    except TypeError:
+        pass
+
+    for field_name, value in kwargs.items():
+        if value is not None:
+            setattr(self, field_name, value)
+
+    for field_name, default in getattr(type(self), "__dk_defaults__", {}).items():
+        if field_name in kwargs:
+            continue
+        if default is not None:
+            setattr(self, field_name, default)
+
+    for field_name, field in getattr(type(self), "__dk_fields__", {}).items():
+        if field_name not in kwargs:
+            setattr(self, field_name, field.default)
+    defaults = type(self).__dict__.get("__dk_defaults__")
+    if defaults:
+        try:
+            self._set_defaults(defaults)
+        except Exception:
+            pass
+
+
+def _compat_getattribute(self: PyDivEntity, name: str) -> Any:
+    # Keep mutable references for constructor-assigned nested entities, so
+    # patterns like `obj.margins.top = ...` behave like in pydivkit.
+    if not name.startswith("_"):
+        value = self._get_constructor_value(name)
+        if isinstance(value, PyDivEntity):
+            try:
+                self._mark_constructor_dirty()
+            except Exception:
+                pass
+            return value
+    value = _ORIG_GETATTRIBUTE(self, name)
+    if name == "margins" and isinstance(value, dict):
+        entity_value = NativeDivEdgeInsets(**value)
+        self._set_constructor_value(name, entity_value)
+        try:
+            self._mark_constructor_dirty()
+        except Exception:
+            pass
+        return entity_value
+    if name == "action" and isinstance(value, dict):
+        try:
+            return NativeDivAction(**value)
+        except Exception:
+            return value
+    if name == "actions" and isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            try:
+                return [NativeDivAction(**item) for item in value]
+            except Exception:
+                return value
+    if name == "visibility_action" and isinstance(value, dict):
+        try:
+            return NativeDivVisibilityAction(**value)
+        except Exception:
+            return value
+    if name == "visibility_actions" and isinstance(value, list):
+        if all(isinstance(item, dict) for item in value):
+            try:
+                return [NativeDivVisibilityAction(**item) for item in value]
+            except Exception:
+                return value
+    return value
+
+
+def _compat_dict(self: PyDivEntity) -> dict[str, Any]:
+    return _ORIG_DICT(self)
+
+
+def _compat_schema(target: Any, exclude_fields: list[str] | None = None) -> dict[str, Any]:
+    if isinstance(target, type):
+        cls = target
+        kwargs = {name: None for name in getattr(cls, "_required_fields", [])}
+        instance = cls(**kwargs)
+        schema = _ORIG_SCHEMA(instance, exclude_fields)
+        return _apply_template_schema_fields(cls, schema, exclude_fields)
+    schema = _ORIG_SCHEMA(target, exclude_fields)
+    return _apply_template_schema_fields(type(target), schema, exclude_fields)
+
+
+def _compat_template(cls: type[PyDivEntity]) -> dict[str, Any]:
+    if not getattr(cls, "__dk_is_template__", False):
+        raise TypeError(f"Component {cls.__name__} is not a template")
+    cached = getattr(cls, "__dk_template__", None)
+    if cached is not None:
+        return cached
+
+    template: dict[str, Any] = {"type": getattr(cls, "__dk_base_type__", None)}
+    for field_name, field_value in getattr(cls, "__dk_tpl_values__", {}).items():
+        dumped = _dump(field_value)
+        if dumped is not None:
+            template[field_name] = dumped
+
+    uid_to_name = {
+        str(field.uid): field.field_name
+        for field in getattr(cls, "__dk_fields__", {}).values()
+        if field.name is not None
+    }
+    template = _replace_ref_markers(template, uid_to_name)
+    cls.__dk_template__ = template
+    return template
+
+
+def _compat_make_card(
+    log_id: str,
+    *card_divs: PyDivEntity,
+    divs: Sequence[PyDivEntity] | None = None,
+    variables: Any = None,
+    variable_triggers: Any = None,
+    timers: Any = None,
+) -> NativePyDivData | NativeDivData:
+    return _compat_make_card_native(
+        log_id,
+        *card_divs,
+        divs=divs,
+        variables=variables,
+        variable_triggers=variable_triggers,
+        timers=timers,
+    )
+
+
+def _compat_make_div(div: PyDivEntity) -> dict[str, Any]:
+    templates: set[type[PyDivEntity]] = set(div.related_templates())
+
+    result = {
+        "templates": {template.template_name: template.template() for template in templates},
+        "card": _compat_make_card("card", div).dict(),
+    }
+    return _normalize_pydivkit_json(result)
+
+
+def install_pydivkit_compat() -> None:
+    _install_constructor_compat()
+    _install_field_names_compat()
+    PyDivEntity.__init__ = _compat_entity_init
+    PyDivEntity.__getattribute__ = _compat_getattribute
+    PyDivEntity.__init_subclass__ = classmethod(_compat_init_subclass)
+    PyDivEntity.schema = _DualMethod(_compat_schema)
+    PyDivEntity.update_forward_refs = classmethod(lambda cls: None)
+    PyDivEntity.template_name = classproperty(lambda cls: _template_name_for_class(cls))
+    PyDivEntity.template = classmethod(_compat_template)
+
+
+BaseEntity = PyDivEntity
+BaseDiv = PyDivEntity
+make_div = _compat_make_div
+make_card = _compat_make_card
